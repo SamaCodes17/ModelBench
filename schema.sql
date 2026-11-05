@@ -1,6 +1,9 @@
 -- ============================================================
 -- ModelBench: LLM Evaluation and Benchmarking Database
--- Database engine: SQLite
+-- Database engine: SQLite 3.30 or newer
+-- (window functions and NULLS LAST are used in the views)
+--
+-- Load order: schema.sql, then seed.sql, then queries.sql
 -- ============================================================
 
 PRAGMA foreign_keys = ON;
@@ -86,6 +89,8 @@ CREATE TABLE benchmark_suites (
 -- 6. Test cases
 -- Each test case belongs to exactly one benchmark suite.
 -- expected_answer is the reference answer or evaluation target.
+-- max_score is the top mark of this test's own rubric; raw scores
+-- in evaluations are converted to a 0-100 scale using it.
 -- ------------------------------------------------------------
 CREATE TABLE test_cases (
     test_case_id INTEGER PRIMARY KEY,
@@ -107,11 +112,15 @@ CREATE TABLE test_cases (
 -- ------------------------------------------------------------
 -- 7. Benchmark runs
 -- One run evaluates one model version against one suite.
+-- attempt_number lets the same version/suite be run again
+-- (a repeat) without overwriting the earlier run.
 -- ------------------------------------------------------------
 CREATE TABLE benchmark_runs (
     run_id INTEGER PRIMARY KEY,
     version_id INTEGER NOT NULL,
     suite_id INTEGER NOT NULL,
+    attempt_number INTEGER NOT NULL DEFAULT 1
+        CHECK (attempt_number >= 1),
     run_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'Pending'
         CHECK (status IN ('Pending', 'Running', 'Completed', 'Failed')),
@@ -127,15 +136,15 @@ CREATE TABLE benchmark_runs (
         REFERENCES benchmark_suites(suite_id)
         ON UPDATE CASCADE
         ON DELETE RESTRICT,
+    UNIQUE (version_id, suite_id, attempt_number),
     CHECK (
         completed_at IS NULL
         OR started_at IS NULL
         OR completed_at >= started_at
     ),
-    CHECK (
-        status <> 'Completed'
-        OR completed_at IS NOT NULL
-    )
+    -- A completed run has a completion time; a pending or running run has none.
+    CHECK (status <> 'Completed' OR completed_at IS NOT NULL),
+    CHECK (status NOT IN ('Pending', 'Running') OR completed_at IS NULL)
 );
 
 -- ------------------------------------------------------------
@@ -169,7 +178,9 @@ CREATE TABLE test_results (
         REFERENCES test_cases(test_case_id)
         ON UPDATE CASCADE
         ON DELETE RESTRICT,
-    UNIQUE (run_id, test_case_id)
+    UNIQUE (run_id, test_case_id),
+    -- A successful execution must have produced a response.
+    CHECK (execution_status <> 'Success' OR response IS NOT NULL)
 );
 
 -- ------------------------------------------------------------
@@ -198,17 +209,21 @@ CREATE TABLE evaluators (
 -- ------------------------------------------------------------
 -- 11. Evaluations
 -- Multiple evaluators/methods may assess one test result.
--- Scores are normalized to a 0-100 scale.
+-- raw_score is the mark on the test case's own scale (0 to
+-- test_cases.max_score). The normalized 0-100 score is derived
+-- by the v_evaluation_scores view, so it can never drift.
+-- hallucination_flag is NULL when the evaluator did not assess
+-- hallucination, which is different from assessing it as 0.
 -- ------------------------------------------------------------
 CREATE TABLE evaluations (
     evaluation_id INTEGER PRIMARY KEY,
     result_id INTEGER NOT NULL,
     method_id INTEGER NOT NULL,
     evaluator_id INTEGER NOT NULL,
-    score REAL NOT NULL
-        CHECK (score BETWEEN 0 AND 100),
-    hallucination_flag INTEGER NOT NULL DEFAULT 0
-        CHECK (hallucination_flag IN (0, 1)),
+    raw_score REAL NOT NULL
+        CHECK (raw_score >= 0),
+    hallucination_flag INTEGER
+        CHECK (hallucination_flag IS NULL OR hallucination_flag IN (0, 1)),
     correctness_notes TEXT,
     evaluated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (result_id)
@@ -229,14 +244,16 @@ CREATE TABLE evaluations (
 -- ============================================================
 -- INDEXES
 -- Index foreign-key columns and common filtering dimensions.
+-- Composite UNIQUE constraints already index these prefixes:
+--   models(provider_id), model_versions(model_id),
+--   benchmark_suites(category_id), test_results(run_id),
+--   evaluations(result_id), benchmark_runs(version_id)
 -- ============================================================
 
 CREATE INDEX idx_test_cases_suite
     ON test_cases(suite_id);
 
--- The unique indexes on (provider_id, model_name), (model_id,
--- version_name), and (category_id, suite_name) support lookups by
--- their leading foreign-key columns.
+-- Serves "most recent run for a model version".
 CREATE INDEX idx_runs_version_date
     ON benchmark_runs(version_id, run_date DESC);
 
@@ -246,14 +263,12 @@ CREATE INDEX idx_runs_suite
 CREATE INDEX idx_runs_status
     ON benchmark_runs(status);
 
--- UNIQUE (run_id, test_case_id) already indexes the run_id prefix.
 CREATE INDEX idx_results_test_case
     ON test_results(test_case_id);
 
 CREATE INDEX idx_results_execution_status
     ON test_results(execution_status);
 
--- UNIQUE (result_id, method_id, evaluator_id) already indexes result_id.
 CREATE INDEX idx_evaluations_method
     ON evaluations(method_id);
 
@@ -272,13 +287,9 @@ CREATE TRIGGER validate_result_suite
 BEFORE INSERT ON test_results
 FOR EACH ROW
 WHEN (
-    SELECT suite_id
-    FROM test_cases
-    WHERE test_case_id = NEW.test_case_id
+    SELECT suite_id FROM test_cases WHERE test_case_id = NEW.test_case_id
 ) IS NOT (
-    SELECT suite_id
-    FROM benchmark_runs
-    WHERE run_id = NEW.run_id
+    SELECT suite_id FROM benchmark_runs WHERE run_id = NEW.run_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'Test case does not belong to the run benchmark suite');
@@ -289,9 +300,7 @@ CREATE TRIGGER validate_run_status
 BEFORE INSERT ON test_results
 FOR EACH ROW
 WHEN (
-    SELECT status
-    FROM benchmark_runs
-    WHERE run_id = NEW.run_id
+    SELECT status FROM benchmark_runs WHERE run_id = NEW.run_id
 ) IS NOT 'Running'
 BEGIN
     SELECT RAISE(ABORT, 'Results can only be added to a running benchmark');
@@ -302,13 +311,9 @@ CREATE TRIGGER validate_result_suite_update
 BEFORE UPDATE OF run_id, test_case_id ON test_results
 FOR EACH ROW
 WHEN (
-    SELECT suite_id
-    FROM test_cases
-    WHERE test_case_id = NEW.test_case_id
+    SELECT suite_id FROM test_cases WHERE test_case_id = NEW.test_case_id
 ) IS NOT (
-    SELECT suite_id
-    FROM benchmark_runs
-    WHERE run_id = NEW.run_id
+    SELECT suite_id FROM benchmark_runs WHERE run_id = NEW.run_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'Test case does not belong to the run benchmark suite');
@@ -354,21 +359,114 @@ BEGIN
     SELECT RAISE(ABORT, 'Results can only be moved to a running benchmark');
 END;
 
+-- A finished run is a historical record: it cannot be reopened.
+CREATE TRIGGER prevent_run_reopen
+BEFORE UPDATE OF status ON benchmark_runs
+FOR EACH ROW
+WHEN OLD.status IN ('Completed', 'Failed')
+ AND NEW.status <> OLD.status
+BEGIN
+    SELECT RAISE(ABORT, 'A completed or failed run cannot change status');
+END;
+
+-- Only a response that was actually produced can be evaluated.
+CREATE TRIGGER validate_evaluated_result
+BEFORE INSERT ON evaluations
+FOR EACH ROW
+WHEN (
+    SELECT execution_status FROM test_results WHERE result_id = NEW.result_id
+) IS NOT 'Success'
+BEGIN
+    SELECT RAISE(ABORT, 'Only successful responses can be evaluated');
+END;
+
+-- A raw score cannot exceed the maximum of the test case it grades.
+CREATE TRIGGER validate_raw_score_insert
+BEFORE INSERT ON evaluations
+FOR EACH ROW
+WHEN NEW.raw_score > (
+    SELECT tc.max_score
+    FROM test_results tr
+    JOIN test_cases tc ON tc.test_case_id = tr.test_case_id
+    WHERE tr.result_id = NEW.result_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'raw_score exceeds the test case max_score');
+END;
+
+CREATE TRIGGER validate_raw_score_update
+BEFORE UPDATE OF raw_score, result_id ON evaluations
+FOR EACH ROW
+WHEN NEW.raw_score > (
+    SELECT tc.max_score
+    FROM test_results tr
+    JOIN test_cases tc ON tc.test_case_id = tr.test_case_id
+    WHERE tr.result_id = NEW.result_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'raw_score exceeds the test case max_score');
+END;
+
+-- Lowering a test case maximum must not invalidate recorded scores.
+CREATE TRIGGER validate_max_score_update
+BEFORE UPDATE OF max_score ON test_cases
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM test_results tr
+    JOIN evaluations e ON e.result_id = tr.result_id
+    WHERE tr.test_case_id = OLD.test_case_id
+      AND e.raw_score > NEW.max_score
+)
+BEGIN
+    SELECT RAISE(ABORT, 'max_score is below an existing raw_score');
+END;
+
+-- An evaluated result cannot later be turned into a failed execution.
+CREATE TRIGGER protect_evaluated_result
+BEFORE UPDATE OF execution_status ON test_results
+FOR EACH ROW
+WHEN NEW.execution_status <> 'Success'
+ AND EXISTS (SELECT 1 FROM evaluations WHERE result_id = OLD.result_id)
+BEGIN
+    SELECT RAISE(ABORT, 'A result with evaluations must stay Success');
+END;
+
 -- ============================================================
 -- VIEWS
 -- Reusable analytical summaries for SQL reporting.
 -- ============================================================
 
--- Summarizes performance by model version and benchmark category.
--- Evaluations are first averaged per result to avoid counting a
--- response multiple times when it has multiple evaluations.
+-- Every evaluation with its score converted to the shared 0-100 scale.
+-- Not rounded, so later averages do not accumulate rounding error.
+CREATE VIEW v_evaluation_scores AS
+SELECT
+    e.evaluation_id,
+    e.result_id,
+    e.method_id,
+    e.evaluator_id,
+    e.raw_score,
+    tc.max_score,
+    100.0 * e.raw_score / tc.max_score AS score,
+    e.hallucination_flag,
+    e.correctness_notes,
+    e.evaluated_at
+FROM evaluations e
+JOIN test_results tr ON tr.result_id = e.result_id
+JOIN test_cases tc ON tc.test_case_id = tr.test_case_id;
+
+-- Summarizes performance by model version and benchmark suite using
+-- completed runs. Evaluations are first averaged per response so a
+-- response with several evaluations still counts once. Results from
+-- repeat runs are pooled, weighting every response equally.
+-- Averages are NOT rounded here; round when displaying.
 CREATE VIEW v_model_performance AS
 WITH result_evaluation AS (
     SELECT
         result_id,
         AVG(score) AS avg_score,
-        AVG(hallucination_flag) AS hallucination_rate
-    FROM evaluations
+        AVG(hallucination_flag) AS hallucination_rate  -- NULL if never assessed
+    FROM v_evaluation_scores
     GROUP BY result_id
 ),
 result_metrics AS (
@@ -400,9 +498,14 @@ run_metrics AS (
             AS timeout_tests,
         COUNT(rm.avg_score) AS evaluated_tests,
         SUM(rm.avg_score) AS total_score,
+        COUNT(rm.hallucination_rate) AS hallucination_assessed,
         SUM(rm.hallucination_rate) AS hallucination_weight,
-        COUNT(rm.latency_ms) AS latency_observations,
-        SUM(rm.latency_ms) AS total_latency_ms,
+        -- Latency of failed attempts (e.g. a 30 s timeout) is excluded
+        -- so it does not distort the speed of normal responses.
+        COUNT(CASE WHEN rm.execution_status = 'Success'
+                   THEN rm.latency_ms END) AS success_latency_observations,
+        SUM(CASE WHEN rm.execution_status = 'Success'
+                 THEN rm.latency_ms END) AS total_success_latency_ms,
         SUM(rm.input_tokens) AS total_input_tokens,
         SUM(rm.output_tokens) AS total_output_tokens,
         COUNT(rm.estimated_cost_usd) AS cost_observations,
@@ -425,17 +528,19 @@ SELECT
     SUM(rm.successful_tests) AS successful_tests,
     SUM(rm.error_tests) AS error_tests,
     SUM(rm.timeout_tests) AS timeout_tests,
-    ROUND(SUM(rm.total_score) / NULLIF(SUM(rm.evaluated_tests), 0), 2)
-        AS avg_score,
-    ROUND(100.0 * SUM(rm.hallucination_weight)
-        / NULLIF(SUM(rm.evaluated_tests), 0), 2) AS hallucination_rate_pct,
-    SUM(rm.latency_observations) AS latency_observations,
-    ROUND(1.0 * SUM(rm.total_latency_ms)
-        / NULLIF(SUM(rm.latency_observations), 0), 2) AS avg_latency_ms,
+    SUM(rm.total_score) AS total_score,
+    SUM(rm.total_score) / NULLIF(SUM(rm.evaluated_tests), 0) AS avg_score,
+    SUM(rm.hallucination_assessed) AS hallucination_assessed,
+    100.0 * SUM(rm.hallucination_weight)
+        / NULLIF(SUM(rm.hallucination_assessed), 0) AS hallucination_rate_pct,
+    SUM(rm.success_latency_observations) AS success_latency_observations,
+    1.0 * SUM(rm.total_success_latency_ms)
+        / NULLIF(SUM(rm.success_latency_observations), 0)
+        AS avg_success_latency_ms,
     SUM(rm.total_input_tokens) AS total_input_tokens,
     SUM(rm.total_output_tokens) AS total_output_tokens,
     SUM(rm.cost_observations) AS cost_observations,
-    ROUND(SUM(rm.total_cost_usd), 6) AS total_cost_usd
+    SUM(rm.total_cost_usd) AS total_cost_usd
 FROM run_metrics rm
 JOIN model_versions mv
     ON rm.version_id = mv.version_id
@@ -460,22 +565,37 @@ GROUP BY
 
 -- Ranks model versions within each suite. Scores are comparable here
 -- because every ranked version used the same benchmark suite.
+-- Ranking uses the unrounded score; the displayed values are rounded.
 CREATE VIEW v_model_leaderboard AS
+WITH ranked AS (
+    SELECT
+        provider_name,
+        model_name,
+        version_name,
+        category_name,
+        suite_name,
+        avg_score,
+        hallucination_rate_pct,
+        avg_success_latency_ms,
+        total_cost_usd,
+        RANK() OVER (
+            PARTITION BY category_name, suite_name
+            ORDER BY
+                avg_score DESC,
+                avg_success_latency_ms ASC NULLS LAST
+        ) AS suite_rank
+    FROM v_model_performance
+    WHERE avg_score IS NOT NULL
+)
 SELECT
     provider_name,
     model_name,
     version_name,
     category_name,
     suite_name,
-    avg_score,
-    hallucination_rate_pct,
-    avg_latency_ms,
-    total_cost_usd,
-    RANK() OVER (
-        PARTITION BY category_name, suite_name
-        ORDER BY
-            avg_score DESC,
-            avg_latency_ms ASC NULLS LAST
-    ) AS suite_rank
-FROM v_model_performance
-WHERE avg_score IS NOT NULL;
+    ROUND(avg_score, 2) AS avg_score,
+    ROUND(hallucination_rate_pct, 2) AS hallucination_rate_pct,
+    ROUND(avg_success_latency_ms, 2) AS avg_success_latency_ms,
+    ROUND(total_cost_usd, 6) AS total_cost_usd,
+    suite_rank
+FROM ranked;
