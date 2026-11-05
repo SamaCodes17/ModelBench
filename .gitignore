@@ -1,0 +1,17 @@
+# SQLite databases and sidecar files created during local use
+*.db
+*.sqlite
+*.sqlite3
+*-journal
+*-shm
+*-wal
+
+# Python cache files from local validation scripts
+__pycache__/
+*.py[cod]
+
+# Common operating-system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
